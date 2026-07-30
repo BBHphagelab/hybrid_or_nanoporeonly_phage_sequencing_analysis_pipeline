@@ -1,0 +1,289 @@
+# =============================================================================
+# maestro_commands_run.txt
+# Manual commands for the Nanopore bacterial pipeline on Maestro (Pasteur)
+# =============================================================================
+# This file documents every command ever run manually on the cluster,
+# organised by topic.  Run from: /pasteur/helix/projects/Phage3C/_projects/Nanopore/cluster/
+#
+# For the full automated pipeline: bash submit_all.sh
+# For a new run: edit SECTION 1 of config.sh (RUN_NAME, EMAIL, PARTITION),
+#   then run submit_all.sh.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# ENVIRONMENT SETUP (run once after first install, or after env rebuild)
+# -----------------------------------------------------------------------------
+
+# Activate the main environment interactively
+eval "$(~/.mamba/bin/micromamba shell hook --shell bash)"
+micromamba activate nanopore_bact
+
+# Add snippy_env to PATH (for step 05 variant calling — snippy uses its own samtools)
+export PATH="${HOME}/.mamba/envs/snippy_env/bin:${PATH}"
+
+# Create the snippy_env (run once — needed because nanopore_bact has samtools 1.21
+# which is newer than snippy's expectations; snippy_env has its own samtools 1.20)
+micromamba create -n snippy_env -c bioconda -c conda-forge snippy=4.6.0
+
+
+# -----------------------------------------------------------------------------
+# FULL PIPELINE SUBMISSION (standard workflow for a new run)
+# -----------------------------------------------------------------------------
+
+cd /pasteur/helix/projects/Phage3C/_projects/Nanopore/cluster
+bash submit_all.sh
+
+# Monitor jobs
+squeue -u tamoreau
+# View logs
+ls results/logs/          # symlink; actual path: ${RESULTS_DIR}/logs/
+tail -f ${RESULTS_DIR}/logs/<jobname.jobid.out>
+
+
+# -----------------------------------------------------------------------------
+# INDIVIDUAL STEP RE-SUBMISSION (if a step fails and needs rerun)
+# -----------------------------------------------------------------------------
+
+cd /pasteur/helix/projects/Phage3C/_projects/Nanopore/cluster
+source config.sh
+
+# ── Step 00: Setup (creates sample_sheet.tsv, merges FASTQs) ──────────────
+sbatch --time="${TIME_SETUP}" --mail-user="${EMAIL}" --mail-type=FAIL \
+    --job-name="nano_00_setup" --ntasks=1 --cpus-per-task=2 --mem=4G \
+    --output="${RESULTS_DIR}/logs/00_setup.%j.out" \
+    --wrap="export TMPDIR=/local/scratch/tmp && source $(pwd)/config.sh && activate_env && bash $(pwd)/steps/00_setup.sh"
+
+# ── Step 01: QC (chopper + NanoStat per barcode) ──────────────────────────
+sbatch --time="${TIME_QC}" --mail-user="${EMAIL}" --mail-type=FAIL \
+    --job-name="nano_01_qc" --array="0-6" \
+    --ntasks=1 --cpus-per-task="${THREADS}" --mem=8G \
+    --output="${RESULTS_DIR}/logs/01_qc.%a.%j.out" \
+    --wrap="export TMPDIR=/local/scratch/tmp && source $(pwd)/config.sh && activate_env && \
+            ARRAY_IDX=\${SLURM_ARRAY_TASK_ID} bash $(pwd)/steps/01_qc.sh"
+
+# ── Step 02: Assembly (Unicycler hybrid or Flye ONT) ──────────────────────
+sbatch --time="${TIME_ASSEMBLE}" --mail-user="${EMAIL}" --mail-type=FAIL \
+    --job-name="nano_02_assemble" --array="0-6" \
+    --ntasks=1 --cpus-per-task="${THREADS}" --mem="${MAX_MEMORY_GB}G" --gres=disk:60000 \
+    --output="${RESULTS_DIR}/logs/02_assemble.%a.%j.out" \
+    --wrap="export TMPDIR=/local/scratch/tmp && source $(pwd)/config.sh && activate_env && \
+            ARRAY_IDX=\${SLURM_ARRAY_TASK_ID} bash $(pwd)/steps/02_assemble.sh"
+
+# ── Step 03: Polishing (Polypolish + Pypolca) ─────────────────────────────
+sbatch --time="${TIME_POLISH}" --mail-user="${EMAIL}" --mail-type=FAIL \
+    --job-name="nano_03_polish" --array="0-6" \
+    --ntasks=1 --cpus-per-task="${THREADS}" --mem=32G --gres=disk:20000 \
+    --output="${RESULTS_DIR}/logs/03_polish.%a.%j.out" \
+    --wrap="export TMPDIR=/local/scratch/tmp && source $(pwd)/config.sh && activate_env && \
+            ARRAY_IDX=\${SLURM_ARRAY_TASK_ID} bash $(pwd)/steps/03_polish.sh"
+
+# ── Step 04: Annotation (Bakta) ───────────────────────────────────────────
+sbatch --time="${TIME_ANNOTATE}" --mail-user="${EMAIL}" --mail-type=FAIL \
+    --job-name="nano_04_annotate" --array="0-6" \
+    --ntasks=1 --cpus-per-task="${THREADS}" --mem=32G \
+    --output="${RESULTS_DIR}/logs/04_annotate.%a.%j.out" \
+    --wrap="export TMPDIR=/local/scratch/tmp && source $(pwd)/config.sh && activate_env && \
+            ARRAY_IDX=\${SLURM_ARRAY_TASK_ID} bash $(pwd)/steps/04_annotate.sh"
+
+# ── Step 05: Variant calling (Snippy) ────────────────────────────────────
+# NOTE: PATH prepend ensures snippy_env's samtools 1.20 is used, not nanopore_bact's 1.21
+sbatch --time="${TIME_COMPARE}" --mail-user="${EMAIL}" --mail-type=FAIL \
+    --job-name="nano_05_compare" --array="0-6" \
+    --ntasks=1 --cpus-per-task="${THREADS}" --mem="${MEM_COMPARE}" \
+    --output="${RESULTS_DIR}/logs/05_compare.%a.%j.out" \
+    --wrap="export TMPDIR=/local/scratch/tmp && source $(pwd)/config.sh && activate_env && \
+            ARRAY_IDX=\${SLURM_ARRAY_TASK_ID} bash $(pwd)/steps/05_compare.sh"
+
+# ── Step 06: Summary ─────────────────────────────────────────────────────
+sbatch --time="${TIME_SUMMARY}" --mail-user="${EMAIL}" --mail-type=FAIL \
+    --job-name="nano_06_summary" \
+    --ntasks=1 --cpus-per-task=2 --mem=8G \
+    --output="${RESULTS_DIR}/logs/06_summary.%j.out" \
+    --wrap="export TMPDIR=/local/scratch/tmp && source $(pwd)/config.sh && activate_env && bash $(pwd)/steps/06_summary.sh"
+
+# ── Step 07: Modified base detection (per barcode) ────────────────────────
+# Requires MOD_DEMUX_DIR to be set in config.sh
+source config.sh
+for i in $(seq 0 6); do
+    sbatch --time="${TIME_MODBASE}" --mail-user="${EMAIL}" --mail-type=FAIL \
+        --job-name="nano_07_modbase" \
+        --ntasks=1 --cpus-per-task="${THREADS}" --mem=64G \
+        --output="${RESULTS_DIR}/logs/07_modbase.${i}.%j.out" \
+        --export=ALL,ARRAY_IDX=${i} \
+        --wrap="cd /pasteur/helix/projects/Phage3C/_projects/Nanopore/cluster && bash steps/07_modbase.sh"
+done
+
+
+# -----------------------------------------------------------------------------
+# MODBASE PREPARATION (run before step 07)
+# -----------------------------------------------------------------------------
+
+cd /pasteur/helix/projects/Phage3C/_projects/Nanopore/cluster
+source config.sh
+
+# ── Option A: Dorado re-basecalling with modification detection (GPU node) ──
+# Only needed if mod_calls.bam does not exist yet.
+# Adjust paths: POD5_INPUT should contain the pod5_pass files.
+DORADO_BIN_DIR="/pasteur/helix/projects/Phage3C/_projects/tools/dorado"
+DORADO_MODELS_DIR="/pasteur/helix/projects/Phage3C/_projects/tools/dorado_models"
+DORADO_MODEL="dna_r10.4.1_e8.2_400bps_hac@v5.0.0"
+POD5_INPUT="${RUN_DIR}/pod5_pass_extracted"
+
+mkdir -p "$(dirname "${MOD_CALLS_BAM}")"
+
+sbatch --parsable --time=12:00:00 \
+    --mail-user="${EMAIL}" --mail-type=begin,end,fail \
+    --job-name="modbase_dorado" \
+    --partition=gpu --gres=gpu:1 \
+    --ntasks=1 --cpus-per-task=16 --mem=64G \
+    --output="${RESULTS_DIR}/logs/modbase_dorado.%j.out" \
+    --wrap="
+set -euo pipefail
+DORADO_BIN='${DORADO_BIN_DIR}/bin/dorado'
+mkdir -p '${DORADO_MODELS_DIR}'
+MODEL_PATH='${DORADO_MODELS_DIR}/${DORADO_MODEL}'
+if [[ ! -d \"\${MODEL_PATH}\" ]]; then
+    echo 'Downloading model...'
+    \${DORADO_BIN} download --model '${DORADO_MODEL}' --directory '${DORADO_MODELS_DIR}'
+fi
+\${DORADO_BIN} basecaller \"\${MODEL_PATH}\" '${POD5_INPUT}' \
+    --modified-bases 6mA 5mCG_5hmCG \
+    --kit-name '${BARCODE_KIT}' \
+    --recursive --device cuda:all \
+    > '${MOD_CALLS_BAM}'
+echo 'Done:' \$(ls -lh '${MOD_CALLS_BAM}')
+"
+
+# ── Option B: Split mod_calls.bam using MinKNOW sequencing_summary ──────────
+# (Recommended — MinKNOW achieves ~94% classification vs Dorado demux ~3.6%)
+# Find the sequencing_summary file:
+SEQ_SUMMARY=$(ls "${SEQ_SUMMARY_DIR}"/sequencing_summary_*.txt 2>/dev/null | head -1)
+echo "Using sequencing summary: ${SEQ_SUMMARY}"
+
+# Run the split (interactive, ~15 min for 950k reads):
+micromamba run -n nanopore_bact python3 \
+    /pasteur/helix/projects/Phage3C/_projects/Nanopore/cluster/split_modbam_by_minknow.py \
+    --mod-bam    "${MOD_CALLS_BAM}" \
+    --summary    "${SEQ_SUMMARY}" \
+    --output-dir "${MOD_DEMUX_DIR}" \
+    --prefix     "minknow_${BARCODE_KIT}"
+
+# Sanitize BAMs after split (fixes BGZF EOF / aux-tag issues for minimap2)
+eval "$(~/.mamba/bin/micromamba shell hook --shell bash)"
+micromamba activate nanopore_bact
+cd "${MOD_DEMUX_DIR}"
+for f in minknow_*.bam; do
+    samtools view -bh "$f" -o tmp.bam && mv tmp.bam "$f" && samtools index "$f" && echo "OK: $f"
+done
+
+
+# -----------------------------------------------------------------------------
+# SNIPPY-CORE (core SNP alignment — run manually after step 05 completes)
+# -----------------------------------------------------------------------------
+# Step 05 now runs snippy-core automatically, but if you need to rerun it:
+
+eval "$(~/.mamba/bin/micromamba shell hook --shell bash)"
+micromamba activate nanopore_bact
+export PATH="${HOME}/.mamba/envs/snippy_env/bin:${PATH}"
+
+RESULTS_DIR="/pasteur/helix/projects/Phage3C/_projects/Nanopore/20260427_ONT_run/results_nanopore"
+cd "${RESULTS_DIR}/05_variants/core_vs_536PAI3/"
+
+snippy-core \
+    --ref "${RESULTS_DIR}/03_polished/barcode01_536PAI3/polished.fasta" \
+    --prefix core \
+    ../barcode02_cloneCS8 \
+    ../barcode03_cloneCS32 \
+    ../barcode04_cloneCS44 \
+    ../barcode05_cloneCS47
+
+# Variant sharing analysis
+# All variants shared by all clones (background mutations):
+awk -F'\t' 'NR>1 { n=0; for(i=4;i<=NF;i++) if($i!="."&&$i!="N") n++; c[n]++ }
+END { for(k in c) print "shared_by_"k":", c[k] }' core.tab
+
+# Clone-unique mutations (phage resistance candidates):
+awk -F'\t' 'NR>1 {
+    n=0; who=3
+    for(i=4;i<=NF;i++) if($i!="."&&$i!="N") { n++; who=i }
+    if(n==1) { names[4]="CS8"; names[5]="CS32"; names[6]="CS44"; names[7]="CS47"
+               print names[who], $1, $2, $3, $who }
+}' core.tab | sort
+
+# Variants near contig ends (likely artefacts — check these first):
+awk -F'\t' 'NR>1 {
+    # col1=chrom col2=pos — flag if pos <=100 (no easy way to check end without ref)
+    if($2<=100) print "EDGE_START", $0
+}' core.tab | head -20
+
+
+# -----------------------------------------------------------------------------
+# METHYLATION ANALYSIS (after step 07)
+# -----------------------------------------------------------------------------
+
+eval "$(~/.mamba/bin/micromamba shell hook --shell bash)"
+micromamba activate nanopore_bact
+
+RESULTS_DIR="/pasteur/helix/projects/Phage3C/_projects/Nanopore/20260427_ONT_run/results_nanopore"
+
+# Quick 6mA count comparison across all samples:
+for bc in barcode01_536PAI3 barcode02_cloneCS8 barcode03_cloneCS32 barcode04_cloneCS44 barcode05_cloneCS47; do
+    bed="${RESULTS_DIR}/07_modbase/${bc}/methylation.bed"
+    [[ -f "$bed" ]] || continue
+    n6mA=$(awk '$4=="a"&&$10>=10&&$11>=50{n++}END{print n+0}' "$bed")
+    n5mC=$(awk '$4=="m"&&$10>=10&&$11>=50{n++}END{print n+0}' "$bed")
+    echo "  ${bc}: 6mA=${n6mA}  5mC=${n5mC}"
+done
+
+# MicrobeMod: R-M motif detection (install once: micromamba install -c bioconda microbemod)
+# Run per sample:
+BC="barcode02_cloneCS8"
+micromamba run -n nanopore_bact \
+    MicrobeMod call_methylation \
+        --bam  "${RESULTS_DIR}/07_modbase/${BC}/aligned_mods.bam" \
+        --reference "${RESULTS_DIR}/03_polished/${BC}/polished.fasta" \
+        --output "${RESULTS_DIR}/07_modbase/${BC}/microbemod/"
+
+# bedtools: find 6mA sites in clones NOT in reference (gained methylation):
+BC="barcode02_cloneCS8"
+awk '$4=="a"&&$10>=10&&$11>=50{print $1"\t"$2"\t"$3}' \
+    "${RESULTS_DIR}/07_modbase/${BC}/methylation.bed" > /tmp/${BC}_6mA.bed
+awk '$4=="a"&&$10>=10&&$11>=50{print $1"\t"$2"\t"$3}' \
+    "${RESULTS_DIR}/07_modbase/barcode01_536PAI3/methylation.bed" > /tmp/bc01_6mA.bed
+
+bedtools intersect -a /tmp/${BC}_6mA.bed -b /tmp/bc01_6mA.bed -v \
+    > /tmp/${BC}_6mA_gained.bed          # sites in clone but NOT in parent
+wc -l /tmp/${BC}_6mA_gained.bed          # count gained sites
+
+
+# -----------------------------------------------------------------------------
+# FOLDER STRUCTURE (for reference)
+# -----------------------------------------------------------------------------
+# On the cluster (helix):
+#
+# /pasteur/helix/projects/Phage3C/_projects/Nanopore/
+# ├── cluster/                         ← pipeline scripts (shared across runs)
+# │   ├── config.sh                    ← edit SECTION 1 per run
+# │   ├── submit_all.sh
+# │   ├── split_modbam_by_minknow.py
+# │   ├── 00_install_env.sh
+# │   ├── maestro_commands_run.txt     ← this file
+# │   └── steps/
+# │       └── 00_setup.sh ... 07_modbase.sh
+# ├── 20260427_ONT_run/                ← RUN_DIR (one per sequencing run)
+# │   ├── MinKnow_output/
+# │   │   ├── sequencing_summary_*.txt
+# │   │   ├── fastq_pass/              ← raw FASTQ (per-barcode subfolders)
+# │   │   └── LS_*/                    ← MinKNOW metadata
+# │   ├── pod5_pass_extracted/         ← POD5 files (for Dorado re-basecalling)
+# │   ├── reads_illumina/              ← barcodeXX_<name>/ with R1/R2
+# │   ├── modbase_raw/
+# │   │   └── mod_calls.bam            ← Dorado output (large, keep at run level)
+# │   └── results_nanopore/            ← all pipeline outputs
+# │       ├── sample_sheet.tsv
+# │       ├── logs/
+# │       ├── 00_merged/ ... 07_modbase/
+# │       └── modbase/
+# │           └── demuxed_minknow/     ← per-barcode mod BAMs
+# └── databases/
+#     └── bakta_db/db/                 ← shared annotation database
